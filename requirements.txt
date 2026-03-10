@@ -1,0 +1,15 @@
+# Core API
+fastapi
+uvicorn[standard]
+python-multipart
+
+# ML / vision
+torch
+torchvision
+pillow
+numpy<2.0
+opencv-python
+
+# Utilities
+scipy
+python-dotenv
