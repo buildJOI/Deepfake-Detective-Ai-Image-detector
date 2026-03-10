@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+
+# Model files
+model/
+*.pt
+
+# Dataset
+dataset/
+
+# OS files
+.DS_Store
+Thumbs.db
