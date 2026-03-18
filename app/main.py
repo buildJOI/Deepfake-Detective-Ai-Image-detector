@@ -17,9 +17,9 @@ from tensorflow.keras.models import load_model
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="AI Image & Video Detector",
+    title="SusAI - AI Media Detector",
     description="Detect AI-generated / deepfake images and videos.",
-    version="3.0.0",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -34,14 +34,42 @@ app.add_middleware(
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_PATH = os.getenv("MODEL_PATH", "model/deepfake_detector.keras")
+MODEL_PATH       = os.getenv("MODEL_PATH", "model/deepfake_detector.keras")
 CLASS_INDEX_PATH = os.getenv("CLASS_INDEX_PATH", "model/class_indices.json")
 
-MAX_IMAGE_MB = 20
-MAX_VIDEO_MB = 200
+MAX_IMAGE_MB = 30
+MAX_VIDEO_MB = 300
 
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp"}
-ALLOWED_VIDEO_TYPES = {"video/mp4", "video/x-msvideo", "video/mpeg", "video/quicktime", "video/webm"}
+# All common image formats — including HEIC/HEIF from iPhone, WebP, etc.
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/bmp",
+    "image/gif",
+    "image/tiff",
+    "image/heic",
+    "image/heif",
+    "image/x-heic",
+    "image/x-heif",
+    "application/octet-stream",  # fallback for some Android phones
+}
+
+# All common video formats from Android/iPhone
+ALLOWED_VIDEO_TYPES = {
+    "video/mp4",
+    "video/x-msvideo",       # .avi
+    "video/mpeg",
+    "video/quicktime",       # .mov (iPhone)
+    "video/webm",
+    "video/x-matroska",      # .mkv
+    "video/3gpp",            # .3gp (older Android)
+    "video/3gpp2",           # .3g2
+    "video/x-m4v",           # .m4v
+    "video/x-flv",           # .flv
+    "application/octet-stream",  # fallback
+}
 
 # ---------------------------------------------------------------------------
 # Load model + class indices at startup
@@ -54,7 +82,6 @@ print("Model loaded!")
 with open(CLASS_INDEX_PATH) as f:
     class_indices = json.load(f)
 
-# Invert: {"FAKE": 0, "REAL": 1} → {0: "FAKE", 1: "REAL"}
 idx_to_label = {v: k.upper() for k, v in class_indices.items()}
 print("Class mapping:", idx_to_label)
 
@@ -63,23 +90,24 @@ print("Class mapping:", idx_to_label)
 # ---------------------------------------------------------------------------
 
 def preprocess_image(pil_img: Image.Image) -> np.ndarray:
-    """Resize, convert to array, and rescale to [0, 1] — matches training."""
+    """Resize, convert to RGB, rescale to [0,1] — matches training."""
     img = pil_img.convert("RGB").resize((224, 224))
     arr = np.array(img, dtype=np.float32)
-    arr = arr / 255.0                   # matches rescale=1./255 used in training
+    arr = arr / 255.0
     arr = np.expand_dims(arr, axis=0)
     return arr
 
 
 def predict_pil(pil_img: Image.Image) -> dict:
+    """Run inference on a PIL image."""
     arr = preprocess_image(pil_img)
     prob = float(model.predict(arr, verbose=0)[0][0])
 
-    predicted_idx = 1 if prob > 0.51 else 0   # ← changed 0.5 to 0.51
+    predicted_idx = 1 if prob > 0.51 else 0
     label = idx_to_label[predicted_idx]
     confidence = prob if predicted_idx == 1 else 1.0 - prob
 
-    # If confidence below 51%, force FAKE
+    # If confidence below 51% → force FAKE
     if confidence * 100 < 51:
         label = "FAKE"
         predicted_idx = 0
@@ -91,13 +119,33 @@ def predict_pil(pil_img: Image.Image) -> dict:
         "raw_score": round(prob, 4),
     }
 
+
+def open_image_bytes(contents: bytes) -> Image.Image:
+    """Try multiple methods to open image bytes — handles HEIC and unusual formats."""
+    # Method 1: PIL directly
+    try:
+        return Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        pass
+
+    # Method 2: OpenCV decode
+    try:
+        np_arr = np.frombuffer(contents, np.uint8)
+        img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img_bgr is not None:
+            return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    except Exception:
+        pass
+
+    raise ValueError("Could not decode image. File may be corrupt or unsupported format.")
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 def home():
-    return {"message": "AI Image & Video Detector API is running", "version": "3.0.0"}
+    return {"message": "SusAI API is running", "version": "4.0.0"}
 
 
 @app.get("/health")
@@ -112,29 +160,28 @@ def health():
 
 @app.post("/predict/image")
 async def predict_image(file: UploadFile = File(...)):
-    """Predict whether a single image is AI-generated / deepfake."""
-    if file.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{file.content_type}'. Allowed: {sorted(ALLOWED_IMAGE_TYPES)}",
-        )
+    """Predict whether an image is AI-generated."""
+    print(f"[IMAGE] Received: {file.filename} | type: {file.content_type}")
 
     contents = await file.read()
 
     if len(contents) > MAX_IMAGE_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_IMAGE_MB} MB.")
 
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
     try:
-        pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not decode image. File may be corrupt.")
+        pil_img = open_image_bytes(contents)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     result = predict_pil(pil_img)
-    result["filename"] = file.filename
+    result["filename"] = file.filename or "image"
     return result
 
 
-# Legacy alias so existing clients don't break
+# Legacy alias
 @app.post("/predict")
 async def predict_legacy(file: UploadFile = File(...)):
     return await predict_image(file)
@@ -146,30 +193,43 @@ async def predict_video(
     frames_every_n: int = 15,
     max_frames: int = 20,
 ):
-    """
-    Predict whether a video is AI-generated / deepfake.
-    Samples up to max_frames frames, runs per-frame inference,
-    and returns an aggregated majority-vote verdict.
-    """
-    if file.content_type not in ALLOWED_VIDEO_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{file.content_type}'. Allowed: {sorted(ALLOWED_VIDEO_TYPES)}",
-        )
+    """Predict whether a video is AI-generated / deepfake."""
+    print(f"[VIDEO] Received: {file.filename} | type: {file.content_type}")
 
     contents = await file.read()
 
     if len(contents) > MAX_VIDEO_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_VIDEO_MB} MB.")
 
-    suffix = os.path.splitext(file.filename or ".mp4")[1] or ".mp4"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
+    # Determine file extension
+    filename = file.filename or "video.mp4"
+    ext = os.path.splitext(filename)[1].lower()
+    if not ext:
+        # Guess from content type
+        ct = (file.content_type or "").lower()
+        if "quicktime" in ct or "mov" in ct:
+            ext = ".mov"
+        elif "3gpp" in ct:
+            ext = ".3gp"
+        elif "webm" in ct:
+            ext = ".webm"
+        else:
+            ext = ".mp4"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(contents)
         tmp_path = tmp.name
 
     try:
         t0 = time.time()
         cap = cv2.VideoCapture(tmp_path)
+
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Could not open video file. Format may be unsupported.")
+
         frames = []
         frame_idx = 0
 
@@ -206,7 +266,7 @@ async def predict_video(
     verdict = "FAKE" if fake_votes >= real_votes else "REAL"
 
     return {
-        "filename": file.filename,
+        "filename": filename,
         "verdict": verdict,
         "fake_votes": fake_votes,
         "real_votes": real_votes,
