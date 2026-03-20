@@ -1,9 +1,12 @@
 fastapi
 uvicorn[standard]
 python-multipart
-opencv-python
-torch
-torchvision
+
+# ML / vision
+tensorflow
 pillow
-numpy  
-scipy
+numpy
+opencv-python
+
+# Utilities
+python-dotenv
